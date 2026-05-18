@@ -68,6 +68,14 @@ GAP_RESOLVED_GRACE_SECONDS="${WAL_BACKUP_GAP_RESOLVED_GRACE_SECONDS:-300}"
 FULL_INTERVAL_HOURS="${WAL_BACKUP_FULL_INTERVAL_HOURS:-168}"
 DIFF_INTERVAL_HOURS="${WAL_BACKUP_DIFF_INTERVAL_HOURS:-24}"
 
+# How often to verify the S3 catalog actually contains a full backup (seconds).
+# Catches divergence between local state (last_full_at) and S3 reality — e.g.
+# the backup command returned exit 0 but the catalog write never completed, or a
+# volume survived a redeployment with stale state pointing at a different stanza
+# path. 0 disables periodic verification (NEEDS_INITIAL_BACKUP still fires on
+# fresh state). Default: 3600 (1 hour).
+CATALOG_VERIFY_INTERVAL_SECONDS="${WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS:-3600}"
+
 # Resolved cadence in seconds. WAL_BACKUP_FULL_INTERVAL_SECONDS overrides
 # the hours setting — bash arithmetic precludes fractional hours, so the
 # e2e harness needs a second-level knob to exercise retention rollover
@@ -145,28 +153,57 @@ run_backup() {
   # --repo=1 scopes backup + post-backup expire to this service's own bucket.
   # On a fork repo2 is source's read-only bucket; without the pin pgBackRest
   # would default to writing the new base into both repos.
-  if pgbackrest --stanza=main --repo=1 backup --type="$type"; then
-    local now; now=$(date +%s)
-    case "$type" in
-      full)
-        write_state_field last_full_at "$now"
-        write_state_field last_diff_at "$now"
-        # Re-read failed_count *after* the backup so a failure during the
-        # backup itself is folded into the high-water mark; otherwise the
-        # next iteration would see growth and re-trigger immediately.
-        refresh_archiver_stats || true
-        write_state_field last_full_failed_count "$FAILED_COUNT"
-        [ -f "$GAP_MARKER" ] && rm -f "$GAP_MARKER" && log "cleared gap marker"
-        ;;
-      diff|incr)
-        write_state_field last_diff_at "$now"
-        ;;
-    esac
-    log "backup --type=$type completed"
-    emit_pitr_anchor
-    return 0
+  pgbackrest --stanza=main --repo=1 backup --type="$type"
+  local exit_code=$?
+
+  # Exit 55 = FileMissingError: backup.info absent — stanza was never
+  # initialized (bootstrap stanza-create failed or timed out on first boot).
+  # Run stanza-create now and retry once; the watcher loop handles the rest.
+  if [ "$exit_code" -eq 55 ]; then
+    log "stanza not initialized (exit 55), running stanza-create then retrying backup..."
+    pgbackrest --stanza=main stanza-create || true
+    pgbackrest --stanza=main --repo=1 backup --type="$type"
+    exit_code=$?
   fi
-  log "backup --type=$type failed (will retry on next poll)"
+
+  if [ "$exit_code" -ne 0 ]; then
+    log "backup --type=$type failed (will retry on next poll)"
+    return 1
+  fi
+
+  local now; now=$(date +%s)
+  case "$type" in
+    full)
+      write_state_field last_full_at "$now"
+      write_state_field last_diff_at "$now"
+      # Re-read failed_count *after* the backup so a failure during the
+      # backup itself is folded into the high-water mark; otherwise the
+      # next iteration would see growth and re-trigger immediately.
+      refresh_archiver_stats || true
+      write_state_field last_full_failed_count "$FAILED_COUNT"
+      [ -f "$GAP_MARKER" ] && rm -f "$GAP_MARKER" && log "cleared gap marker"
+      ;;
+    diff|incr)
+      write_state_field last_diff_at "$now"
+      ;;
+  esac
+  log "backup --type=$type completed"
+  emit_pitr_anchor
+  return 0
+}
+
+# Probes the S3 catalog for repo1 via pgbackrest info --output=json.
+# No text-parsing heuristics needed. Returns three distinct states:
+#   0 — full backup confirmed present (pgbackrest exit 0 + "full" in output)
+#   1 — conclusively no full backup (pgbackrest exit 0, no "full" entry)
+#   2 — inconclusive (pgbackrest exited non-zero: S3 unreachable, auth failure,
+#       stanza not yet created, etc.) — caller must NOT clear local state
+catalog_check_backup() {
+  local info_out rc
+  info_out=$(timeout 60 pgbackrest --stanza=main --repo=1 info --output=json 2>/dev/null)
+  rc=$?
+  [ "$rc" -ne 0 ] && return 2
+  printf '%s' "$info_out" | grep -q '"type":"full"' && return 0
   return 1
 }
 
@@ -195,6 +232,36 @@ decide_action() {
   # time on idle DBs (heartbeat → archive_timeout → archive-push cycle).
   if [ -z "$last_full" ]; then
     DECIDED_ACTION="full"; return 0
+  fi
+
+  # Catalog verification — periodically confirm S3 actually has a full backup.
+  # Catches divergence between local state and S3 reality: the backup command
+  # may have returned exit 0 without committing catalog metadata (S3 partial
+  # write, stanza-create race), or a volume survived a redeployment with stale
+  # state pointing at a different stanza/sysid path. Only clears state when the
+  # catalog explicitly confirms "no backup" (exit 0 + empty backup list); an
+  # unreachable S3 or missing stanza returns non-zero and is treated as
+  # inconclusive so we don't burn a full on every transient S3 hiccup.
+  local last_catalog_verify
+  last_catalog_verify=$(read_state last_catalog_verify_at)
+  local needs_verify=0
+  if [ -z "$last_catalog_verify" ] || [ $((now - last_catalog_verify)) -ge "$CATALOG_VERIFY_INTERVAL_SECONDS" ]; then
+    needs_verify=1
+  fi
+  if [ "$needs_verify" -eq 1 ]; then
+    write_state_field last_catalog_verify_at "$now"
+    log "verifying S3 catalog has full backup"
+    catalog_check_backup
+    local _crc=$?
+    if [ "$_crc" -eq 0 ]; then
+      log "catalog verified — full backup present in S3"
+    elif [ "$_crc" -eq 2 ]; then
+      log "catalog check inconclusive (S3 unreachable or stanza not yet created); skipping"
+    else
+      log "catalog shows no full backup despite local state (last_full=${last_full}); clearing last_full_at to trigger new full"
+      write_state_field last_full_at ""
+      DECIDED_ACTION="full"; return 0
+    fi
   fi
 
   # Gap recovery — explicit drop marker OR failed_count grew since last full.
