@@ -10,10 +10,13 @@
 #      the base in pg_backup_start/stop so the LSN window of the base and
 #      the WAL covering it are the same thing — no coordination gap.
 #   2. Gap recovery — archive-push had hard failures since the last full
-#      (either pgbackrest-archive-push-wrapper.sh dropped a segment and
-#      touched .pgbackrest_gap_pending, or pg_stat_archiver.failed_count grew
-#      since the last full's checkpoint). Once failures are decisively over,
-#      runs a fresh full so PITR window resumes from this base forward.
+#      (any of: pgbackrest-archive-push-wrapper.sh dropped a segment and
+#      touched .pgbackrest_gap_pending, pg_stat_archiver.failed_count grew
+#      since the last full's checkpoint, or the LSN-lag probe found
+#      pg_stat_archiver.last_archived_wal more than
+#      WAL_LAG_GAP_THRESHOLD_SEGMENTS ahead of the S3 catalog's high-water).
+#      Once failures are decisively over, runs a fresh full so PITR window
+#      resumes from this base forward.
 #   3. Periodic — full every WAL_BACKUP_FULL_INTERVAL_HOURS, diff every
 #      WAL_BACKUP_DIFF_INTERVAL_HOURS.
 #
@@ -38,11 +41,21 @@
 # ~one 16MB WAL segment per minute on idle DBs (zstd-3 compresses to a
 # handful of KB → ~30-70MB/day). Set WAL_HEARTBEAT_DISABLED=1 to skip.
 #
-# Known gap: pgBackRest's archive-push-queue-max trip drops segments without
-# incrementing pg_stat_archiver.failed_count and without going through our
-# archive-push wrapper, so neither gap signal fires. Until log-parsing or LSN-
-# lag detection lands, queue-max-trip gaps are sealed by the next periodic
-# full rather than promptly. Documented in README.
+# LSN-lag detection: pgBackRest async mode returns archive_command success to
+# Postgres as soon as the WAL segment lands in the local spool, BEFORE the
+# async worker uploads it to S3. If the async worker hangs, dies without
+# releasing its lock, or hits an unrecoverable upload error, the spool keeps
+# accepting WAL (foreground returns 0) while the S3 catalog stays frozen.
+# archive-push-queue-max eventually drops segments and ALSO returns 0 to
+# Postgres — so pg_stat_archiver.failed_count never increments and the
+# archive-push wrapper never sees a non-zero exit. Both other gap signals
+# (failed_count growth, wrapper-touched marker) miss this entirely. The
+# LSN-lag probe re-uses the same comparison the admin monitor performs on
+# the backboard side: `pgbackrest info`'s archive max segment per timeline
+# against pg_stat_archiver.last_archived_wal. Threshold matches the
+# monitor's WAL_ARCHIVE_LAG_CRIT_SEGMENTS (64 segments ≈ 1 GiB) so the
+# in-image self-heal fires at the same point the dashboard surfaces the
+# warning.
 
 set -u
 
@@ -76,6 +89,15 @@ DIFF_INTERVAL_HOURS="${WAL_BACKUP_DIFF_INTERVAL_HOURS:-24}"
 # fresh state). Default: 3600 (1 hour).
 CATALOG_VERIFY_INTERVAL_SECONDS="${WAL_BACKUP_CATALOG_VERIFY_INTERVAL_SECONDS:-3600}"
 
+# LSN-lag detection — see file header. Threshold matches the admin monitor's
+# WAL_ARCHIVE_LAG_CRIT_SEGMENTS. Probe cadence is the dominant cost (one
+# `pgbackrest info` S3 round-trip per probe; ~50-200ms typical), so don't run
+# it every iteration. Default 300s (5min) gives ~5 min worst-case detection
+# latency, fast enough that the gap-recovery grace then the resulting full
+# happen well within an hour of the underlying break.
+WAL_LAG_GAP_THRESHOLD_SEGMENTS="${WAL_LAG_GAP_THRESHOLD_SEGMENTS:-64}"
+WAL_LAG_PROBE_INTERVAL_SECONDS="${WAL_LAG_PROBE_INTERVAL_SECONDS:-300}"
+
 # Resolved cadence in seconds. WAL_BACKUP_FULL_INTERVAL_SECONDS overrides
 # the hours setting — bash arithmetic precludes fractional hours, so the
 # e2e harness needs a second-level knob to exercise retention rollover
@@ -90,9 +112,11 @@ log() { echo "pgbackrest-watcher: $*"; }
 
 # State file is `key=value\n`-shaped: trivially read/written by bash without
 # adding a JSON dep. Schema (all values are integer epoch seconds or counts):
-#   last_full_at=<epoch>
-#   last_diff_at=<epoch>
-#   last_full_failed_count=<int>
+#   last_full_at=<epoch>             — last successful full backup
+#   last_diff_at=<epoch>             — last successful diff/incr backup
+#   last_full_failed_count=<int>     — pg_stat_archiver.failed_count after last full
+#   last_catalog_verify_at=<epoch>   — last S3 catalog probe (catalog_check_backup)
+#   last_lag_detected_at=<epoch>     — when LSN-lag first crossed threshold this cycle
 read_state() {
   local field="$1"
   [ ! -f "$STATE_FILE" ] && return 0
@@ -116,19 +140,29 @@ ARCHIVED_COUNT=0
 FAILED_COUNT=0
 LAST_ARCHIVED_EPOCH=0
 LAST_FAILED_EPOCH=0
+LAST_ARCHIVED_WAL=""
 
+# COALESCE(last_archived_wal, '-') keeps the field non-empty so `read -r`'s
+# whitespace IFS-splitting doesn't collapse a trailing empty column into the
+# previous one and corrupt the bind. The sentinel is stripped below.
 refresh_archiver_stats() {
-  local stats
+  local stats wal_field
   stats=$(psql -U postgres -tAXq -F' ' -c "
     SELECT
       archived_count,
       failed_count,
       COALESCE(EXTRACT(EPOCH FROM last_archived_time)::bigint, 0),
-      COALESCE(EXTRACT(EPOCH FROM last_failed_time)::bigint, 0)
+      COALESCE(EXTRACT(EPOCH FROM last_failed_time)::bigint, 0),
+      COALESCE(last_archived_wal, '-')
     FROM pg_stat_archiver
   " 2>/dev/null) || return 1
   [ -z "$stats" ] && return 1
-  read -r ARCHIVED_COUNT FAILED_COUNT LAST_ARCHIVED_EPOCH LAST_FAILED_EPOCH <<<"$stats"
+  read -r ARCHIVED_COUNT FAILED_COUNT LAST_ARCHIVED_EPOCH LAST_FAILED_EPOCH wal_field <<<"$stats"
+  if [ "$wal_field" = "-" ]; then
+    LAST_ARCHIVED_WAL=""
+  else
+    LAST_ARCHIVED_WAL="$wal_field"
+  fi
 }
 
 # 0 = standby (skip backups). 1 = leader-or-unknown (proceed; pgBackRest's
@@ -139,12 +173,22 @@ is_standby() {
   [ "$r" = "t" ]
 }
 
-# Returns 0 if archive failures look decisively over.
+# Returns 0 if archive failures look decisively over. Considers both the
+# pg_stat_archiver.last_failed_time epoch AND the LSN-lag detection epoch
+# (last_lag_detected_at). Either signal still within grace blocks recovery;
+# both signals quiescent (or never tripped) clears for a fresh full.
 gap_recovered() {
   local now="$1" last_fail="$2"
-  # Never failed (fresh stat reset, or never had a failure) → trivially recovered.
-  [ "$last_fail" -eq 0 ] && return 0
-  [ $((now - last_fail)) -ge "$GAP_RESOLVED_GRACE_SECONDS" ]
+  local last_lag
+  last_lag=$(read_state last_lag_detected_at)
+  : "${last_lag:=0}"
+  if [ "$last_fail" -gt 0 ] && [ $((now - last_fail)) -lt "$GAP_RESOLVED_GRACE_SECONDS" ]; then
+    return 1
+  fi
+  if [ "$last_lag" -gt 0 ] && [ $((now - last_lag)) -lt "$GAP_RESOLVED_GRACE_SECONDS" ]; then
+    return 1
+  fi
+  return 0
 }
 
 run_backup() {
@@ -181,6 +225,11 @@ run_backup() {
       # next iteration would see growth and re-trigger immediately.
       refresh_archiver_stats || true
       write_state_field last_full_failed_count "$FAILED_COUNT"
+      # last_lag_detected_at is gap-recovery state same as last_failed_count;
+      # clearing alongside the gap marker keeps gap_recovered's next-round
+      # grace window honest. Without this, a fresh detection right after a
+      # successful full would still see the stale epoch.
+      write_state_field last_lag_detected_at 0
       [ -f "$GAP_MARKER" ] && rm -f "$GAP_MARKER" && log "cleared gap marker"
       ;;
     diff|incr)
@@ -205,6 +254,104 @@ catalog_check_backup() {
   [ "$rc" -ne 0 ] && return 2
   printf '%s' "$info_out" | grep -q '"type":"full"' && return 0
   return 1
+}
+
+# LSN-lag probe state. LAST_LAG_PROBE_AT throttles probe_archive_lag to
+# WAL_LAG_PROBE_INTERVAL_SECONDS; LAST_OBSERVED_LAG_SEGMENTS surfaces the
+# most recent observation for the watcher_iteration diagnostic log.
+LAST_LAG_PROBE_AT=0
+LAST_OBSERVED_LAG_SEGMENTS=0
+LAST_LAG_REPO_MAX=""
+
+# 24-char hex WAL filename → absolute segment count (256 segments per log
+# file under the default 16 MiB wal_segment_size). Echoes empty on malformed
+# input so callers short-circuit. Strict shape check before the arithmetic
+# avoids letting a stray non-hex character feed `$((16#…))` and crash the
+# watcher via set -u + arithmetic failure.
+segment_to_number() {
+  local wal="$1"
+  [ ${#wal} -eq 24 ] || return 0
+  case "$wal" in
+    *[!0-9A-Fa-f]*) return 0 ;;
+  esac
+  local log seg
+  log=$((16#${wal:8:8}))
+  seg=$((16#${wal:16:8}))
+  echo $((log * 256 + seg))
+}
+
+# Run `pgbackrest info` and extract the highest archived WAL segment on the
+# same timeline as LAST_ARCHIVED_WAL, then compute lag against
+# pg_stat_archiver's handoff high-water. Updates LAST_OBSERVED_LAG_SEGMENTS
+# and LAST_LAG_REPO_MAX. Returns 0 on a successful probe (even when lag is
+# 0); returns 1 on transient failure so callers leave prior state in place
+# rather than acting on noise.
+#
+# The JSON is text-parsed because jq isn't in the base image and `pgbackrest
+# info`'s archive section has a stable schema: each archive entry has a
+# "max":"<24-hex>" key per timeline. Filtering by the leading 8 hex chars
+# (timeline ID) picks the right entry without a full parser.
+probe_archive_lag() {
+  [ -z "$LAST_ARCHIVED_WAL" ] && { LAST_OBSERVED_LAG_SEGMENTS=0; return 0; }
+  local handed_off_n; handed_off_n=$(segment_to_number "$LAST_ARCHIVED_WAL")
+  [ -z "$handed_off_n" ] && return 1
+
+  local info_out
+  info_out=$(timeout 30 pgbackrest --stanza=main --repo=1 info --output=json 2>/dev/null) || return 1
+  [ -z "$info_out" ] && return 1
+
+  local tl="${LAST_ARCHIVED_WAL:0:8}"
+  local repo_max
+  repo_max=$(printf '%s' "$info_out" \
+    | grep -oE "\"max\":\"${tl}[0-9A-Fa-f]{16}\"" \
+    | sort -u | tail -1 \
+    | sed -E 's/.*"([0-9A-Fa-f]{24})".*/\1/')
+  if [ -z "$repo_max" ]; then
+    # Same timeline not in catalog yet (fresh stanza, no archived WAL).
+    # Treat as zero lag — NEEDS_INITIAL_BACKUP / stanza-create paths cover
+    # the empty-catalog cases without our help.
+    LAST_OBSERVED_LAG_SEGMENTS=0
+    LAST_LAG_REPO_MAX=""
+    return 0
+  fi
+
+  local repo_max_n; repo_max_n=$(segment_to_number "$repo_max")
+  [ -z "$repo_max_n" ] && return 1
+  local lag=$((handed_off_n - repo_max_n))
+  [ "$lag" -lt 0 ] && lag=0
+  LAST_OBSERVED_LAG_SEGMENTS="$lag"
+  LAST_LAG_REPO_MAX="$repo_max"
+  return 0
+}
+
+# Throttled wrapper around probe_archive_lag that writes the gap marker +
+# last_lag_detected_at state field when observed lag crosses the threshold.
+# Idempotent: re-detecting an already-marked gap only refreshes the log
+# breadcrumb, never re-stamps last_lag_detected_at (that would make
+# gap_recovered's grace check sticky and prevent the gap from ever clearing).
+check_lsn_lag_and_mark_gap() {
+  local now; now=$(date +%s)
+  if [ $((now - LAST_LAG_PROBE_AT)) -lt "$WAL_LAG_PROBE_INTERVAL_SECONDS" ]; then
+    return 0
+  fi
+  LAST_LAG_PROBE_AT="$now"
+
+  if ! probe_archive_lag; then
+    log "lag probe inconclusive (pgbackrest info failed or malformed); leaving prior state"
+    return 0
+  fi
+
+  if [ "$LAST_OBSERVED_LAG_SEGMENTS" -lt "$WAL_LAG_GAP_THRESHOLD_SEGMENTS" ]; then
+    return 0
+  fi
+
+  if [ ! -f "$GAP_MARKER" ]; then
+    touch "$GAP_MARKER"
+    write_state_field last_lag_detected_at "$now"
+    log "LSN-lag gap detected (handoff=${LAST_ARCHIVED_WAL}, repo_max=${LAST_LAG_REPO_MAX:-?}, lag=${LAST_OBSERVED_LAG_SEGMENTS} segments ≥ threshold ${WAL_LAG_GAP_THRESHOLD_SEGMENTS}) — marking gap_pending"
+  else
+    log "LSN-lag persists (handoff=${LAST_ARCHIVED_WAL}, repo_max=${LAST_LAG_REPO_MAX:-?}, lag=${LAST_OBSERVED_LAG_SEGMENTS} segments)"
+  fi
 }
 
 # Sets DECIDED_ACTION to "full"|"diff"|"" (no action). Runs in the caller's
@@ -264,8 +411,10 @@ decide_action() {
     fi
   fi
 
-  # Gap recovery — explicit drop marker OR failed_count grew since last full.
-  # Either signal indicates archive-push had problems since the last
+  # Gap recovery — drop marker (touched by archive-push wrapper on hard
+  # failure OR by check_lsn_lag_and_mark_gap when async-side queue-max-trip
+  # is inferred from LSN lag) OR failed_count grew since last full. Any of
+  # the three indicates archive-push had problems since the last
   # LSN-coordinated baseline, so a fresh full re-anchors the PITR window.
   local has_gap=0
   [ -f "$GAP_MARKER" ] && has_gap=1
@@ -349,11 +498,18 @@ watcher_iteration() {
     return 0
   fi
 
+  # Detect silent async failure modes (queue-max-trip with no failed_count
+  # bump, stuck async worker holding the lock, …) by comparing the WAL
+  # segment Postgres handed off against the S3 catalog high-water. Throttled
+  # internally to WAL_LAG_PROBE_INTERVAL_SECONDS so we don't S3-round-trip
+  # every iteration.
+  check_lsn_lag_and_mark_gap
+
   decide_action
   if [ -z "$DECIDED_ACTION" ]; then
     # Surface why decide_action stayed silent so post-mortems on "watcher
     # ran for N minutes and never took a backup" don't require guessing.
-    log "iteration: no action (last_full=${LAST_FULL_DIAG:-?}, archived=${ARCHIVED_COUNT:-?}, failed=${FAILED_COUNT:-?}, gap_marker=${GAP_MARKER_DIAG:-?}, last_full_failed=${LAST_FULL_FAILED_DIAG:-?})"
+    log "iteration: no action (last_full=${LAST_FULL_DIAG:-?}, archived=${ARCHIVED_COUNT:-?}, failed=${FAILED_COUNT:-?}, gap_marker=${GAP_MARKER_DIAG:-?}, last_full_failed=${LAST_FULL_FAILED_DIAG:-?}, lag=${LAST_OBSERVED_LAG_SEGMENTS:-?})"
     return 0
   fi
 
@@ -382,7 +538,7 @@ sync_repo_path_from_marker() {
 
 sync_repo_path_from_marker
 
-log "starting (poll=${POLL_INTERVAL_SECONDS}s, initial_poll=${INITIAL_POLL_SECONDS}s, full=${FULL_INTERVAL_SECONDS}s, diff=${DIFF_INTERVAL_SECONDS}s, gap_grace=${GAP_RESOLVED_GRACE_SECONDS}s, repo1-path=${PGBACKREST_REPO1_PATH:-unset})"
+log "starting (poll=${POLL_INTERVAL_SECONDS}s, initial_poll=${INITIAL_POLL_SECONDS}s, full=${FULL_INTERVAL_SECONDS}s, diff=${DIFF_INTERVAL_SECONDS}s, gap_grace=${GAP_RESOLVED_GRACE_SECONDS}s, lag_probe=${WAL_LAG_PROBE_INTERVAL_SECONDS}s, lag_threshold=${WAL_LAG_GAP_THRESHOLD_SEGMENTS} segments, repo1-path=${PGBACKREST_REPO1_PATH:-unset})"
 
 while true; do
   sync_repo_path_from_marker
