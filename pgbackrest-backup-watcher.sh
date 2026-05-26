@@ -161,34 +161,27 @@ FAILED_COUNT=0
 LAST_ARCHIVED_EPOCH=0
 LAST_FAILED_EPOCH=0
 LAST_ARCHIVED_WAL=""
-LAST_FAILED_WAL=""
 
-# COALESCE(…, '-') keeps fields non-empty so `read -r`'s whitespace
-# IFS-splitting doesn't collapse trailing empty columns into the previous one
-# and corrupt the bind. The sentinel is stripped below.
+# COALESCE(last_archived_wal, '-') keeps the field non-empty so `read -r`'s
+# whitespace IFS-splitting doesn't collapse a trailing empty column into the
+# previous one and corrupt the bind. The sentinel is stripped below.
 refresh_archiver_stats() {
-  local stats wal_field failed_wal_field
+  local stats wal_field
   stats=$(psql -U postgres -tAXq -F' ' -c "
     SELECT
       archived_count,
       failed_count,
       COALESCE(EXTRACT(EPOCH FROM last_archived_time)::bigint, 0),
       COALESCE(EXTRACT(EPOCH FROM last_failed_time)::bigint, 0),
-      COALESCE(last_archived_wal, '-'),
-      COALESCE(last_failed_wal, '-')
+      COALESCE(last_archived_wal, '-')
     FROM pg_stat_archiver
   " 2>/dev/null) || return 1
   [ -z "$stats" ] && return 1
-  read -r ARCHIVED_COUNT FAILED_COUNT LAST_ARCHIVED_EPOCH LAST_FAILED_EPOCH wal_field failed_wal_field <<<"$stats"
+  read -r ARCHIVED_COUNT FAILED_COUNT LAST_ARCHIVED_EPOCH LAST_FAILED_EPOCH wal_field <<<"$stats"
   if [ "$wal_field" = "-" ]; then
     LAST_ARCHIVED_WAL=""
   else
     LAST_ARCHIVED_WAL="$wal_field"
-  fi
-  if [ "$failed_wal_field" = "-" ]; then
-    LAST_FAILED_WAL=""
-  else
-    LAST_FAILED_WAL="$failed_wal_field"
   fi
 }
 
@@ -405,63 +398,6 @@ kick_async_daemon() {
   pkill -f 'archive-push:async' 2>/dev/null || true
 }
 
-# Self-heals a WAL_REGRESSION condition by migrating archiving to a new S3
-# path suffix (e.g. cluster-SYSID → cluster-SYSID-2). WAL_REGRESSION occurs
-# when a volume snapshot rollback restores the data directory to an earlier LSN
-# while S3 retains the pre-rollback WAL at the same segment names. pgBackRest
-# refuses to overwrite existing S3 objects with different content (exit 45) so
-# every archive-push fails — pkill-async cycles do not fix this.
-#
-# The migration is non-destructive: the old path and all its backups remain in
-# S3 untouched. Both the archive-push wrapper and this watcher re-read
-# .pgbackrest_repo_path on every call/iteration, so writing the new path there
-# takes effect immediately without a redeploy.
-#
-# After writing the new path, all backup state is reset so the next iteration
-# enters NEEDS_INITIAL_BACKUP and triggers the stanza-create + full backup via
-# the standard run_backup path (exit 55 → stanza-create → retry). Clearing
-# GAP_MARKER here is required — decide_action skips all action while the
-# marker is set, which would create a chicken-and-egg with the new stanza.
-migrate_to_new_archive_path() {
-  local old_path="${PGBACKREST_REPO1_PATH}"
-
-  # Store the original (gen 0) path once so successive migrations produce
-  # -2, -3, … instead of chaining suffixes like -2-2.
-  local orig_path
-  orig_path=$(read_state wal_regression_orig_path)
-  if [ -z "$orig_path" ]; then
-    orig_path="${PGBACKREST_REPO1_PATH}"
-    write_state_field wal_regression_orig_path "$orig_path"
-  fi
-
-  local gen
-  gen=$(read_state wal_regression_gen); : "${gen:=0}"
-  gen=$((gen + 1))
-  write_state_field wal_regression_gen "$gen"
-
-  # Suffix: gen=1 → -2, gen=2 → -3, etc.
-  local new_path="${orig_path}-$((gen + 1))"
-
-  log "wal-regression: migrating archive path (${old_path} → ${new_path}); old backups preserved at former path"
-
-  printf '%s' "$new_path" > "$PGDATA/.pgbackrest_repo_path"
-  PGBACKREST_REPO1_PATH="$new_path"
-  export PGBACKREST_REPO1_PATH
-
-  # Reset all backup state so the next iteration enters NEEDS_INITIAL_BACKUP
-  # at the new path. GAP_MARKER cleared so decide_action is unblocked.
-  write_state_field last_full_at ""
-  write_state_field last_diff_at ""
-  write_state_field last_full_failed_count 0
-  write_state_field last_lag_detected_at 0
-  write_state_field catalog_max_at_detection ""
-  write_state_field last_force_recovery_at 0
-  write_state_field force_attempts 0
-  rm -f "$GAP_MARKER"
-
-  log "wal-regression: state reset; next iteration will initialize stanza and take full backup at ${new_path}"
-}
-
 # Recovery state machine. Replaces the old "wait for grace then take a full"
 # path with: detect → wait 10 min → pkill → wait 10 min → pkill → … →
 # (catalog advances) → take diff → clear. Repeats pkill every backoff window
@@ -553,29 +489,6 @@ gap_recovery_step() {
     local since_action=$((now - last_action_at))
 
     if [ "$since_action" -ge "$GAP_RECOVERY_BACKOFF_SECONDS" ]; then
-      # Escape hatch: after ≥2 pkill cycles with no catalog advance, check
-      # whether this is a WAL_REGRESSION. If last_failed_wal is behind the
-      # catalog max on the same timeline, pkill-async cannot fix the conflict
-      # (the issue is structural — pgBackRest refuses to overwrite existing
-      # S3 objects with different content after a data-dir rollback).
-      if [ "${force_attempts:-0}" -ge 2 ] && [ -n "$LAST_FAILED_WAL" ] && [ -n "$catalog_max" ] \
-         && [ "${LAST_FAILED_EPOCH:-0}" -gt "${LAST_ARCHIVED_EPOCH:-0}" ]; then
-        local wr_ftl wr_ctlmax_tl
-        wr_ftl="${LAST_FAILED_WAL:0:8}"
-        wr_ctlmax_tl="${catalog_max:0:8}"
-        if [ "$wr_ftl" = "$wr_ctlmax_tl" ]; then
-          local wr_f_n wr_c_n
-          wr_f_n=$(segment_to_number "$LAST_FAILED_WAL")
-          wr_c_n=$(segment_to_number "$catalog_max")
-          if [ -n "$wr_f_n" ] && [ -n "$wr_c_n" ] && [ "$wr_f_n" -lt "$wr_c_n" ]; then
-            GAP_STATE_DIAG="wal-regression"
-            log "wal-regression: detected after ${force_attempts} pkill attempts (failed_wal=${LAST_FAILED_WAL}, catalog_max=${catalog_max}) — self-healing"
-            migrate_to_new_archive_path
-            return 0
-          fi
-        fi
-      fi
-
       force_attempts=$((force_attempts + 1))
       local stuck_min=$(( (now - detected_at) / 60 ))
       log "gap-recovery: catalog frozen at ${catalog_at_detection} for ${stuck_min}min (handoff=${LAST_ARCHIVED_WAL}, lag=${lag}) — pkill async (attempt #${force_attempts})"
@@ -605,34 +518,6 @@ gap_recovery_step() {
   [ "${FAILED_COUNT:-0}" -gt "$last_full_failed" ] && failed_grew=1
 
   if [ "$lag" -ge "$WAL_LAG_GAP_THRESHOLD_SEGMENTS" ] || [ "$failed_grew" -eq 1 ]; then
-    # Before entering the pkill-cycle state machine, check whether this is a
-    # WAL_REGRESSION: last_failed_wal is behind the catalog max on the same
-    # timeline, meaning pgBackRest is refusing to overwrite existing S3 objects
-    # with different content (exit 45). pkill-async cannot fix this — it is a
-    # structural archive conflict, not a stuck process. Self-heal immediately
-    # by migrating to a new archive path suffix.
-    #
-    # Guard: LAST_FAILED_EPOCH > LAST_ARCHIVED_EPOCH confirms the failure is
-    # currently active, not a stale pg_stat_archiver.last_failed_wal from an
-    # old transient error (those fields are sticky until postgres restart).
-    if [ "$failed_grew" -eq 1 ] && [ -n "$LAST_FAILED_WAL" ] && [ -n "$catalog_max" ] \
-       && [ "${LAST_FAILED_EPOCH:-0}" -gt "${LAST_ARCHIVED_EPOCH:-0}" ]; then
-      local wr_ftl wr_ctlmax_tl
-      wr_ftl="${LAST_FAILED_WAL:0:8}"
-      wr_ctlmax_tl="${catalog_max:0:8}"
-      if [ "$wr_ftl" = "$wr_ctlmax_tl" ]; then
-        local wr_f_n wr_c_n
-        wr_f_n=$(segment_to_number "$LAST_FAILED_WAL")
-        wr_c_n=$(segment_to_number "$catalog_max")
-        if [ -n "$wr_f_n" ] && [ -n "$wr_c_n" ] && [ "$wr_f_n" -lt "$wr_c_n" ]; then
-          GAP_STATE_DIAG="wal-regression"
-          log "wal-regression: detected (failed_wal=${LAST_FAILED_WAL}, catalog_max=${catalog_max}, failed_count=${FAILED_COUNT:-0}) — self-healing immediately"
-          migrate_to_new_archive_path
-          return 0
-        fi
-      fi
-    fi
-
     touch "$GAP_MARKER"
     write_state_field last_lag_detected_at "$now"
     write_state_field catalog_max_at_detection "$catalog_max"
